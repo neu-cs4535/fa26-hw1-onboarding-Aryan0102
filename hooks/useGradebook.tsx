@@ -135,6 +135,21 @@ export function useGradebookColumns() {
   return columns;
 }
 
+export function useGradebookColumnGroups() {
+  const gradebookController = useGradebookController();
+  const [groups, setGroups] = useState<Database["public"]["Tables"]["gradebook_column_groups"]["Row"][]>(
+    gradebookController.gradebook_column_groups.rows
+  );
+
+  useEffect(() => {
+    return gradebookController.gradebook_column_groups.list((data) => {
+      setGroups(data);
+    }).unsubscribe;
+  }, [gradebookController]);
+
+  return groups;
+}
+
 /**
  * Subscribes to changes in `gradebooks.expression_prefix` so any component
  * that depends on the prefix (e.g. the Expression Builder's render-expression
@@ -1403,8 +1418,9 @@ export class GradebookController {
   readonly gradebook_columns: TableController<"gradebook_columns">;
   readonly table: GradebookCellController;
   readonly assignments_table: TableController<"assignments">;
+  readonly gradebook_column_groups: TableController<"gradebook_column_groups">;
 
-  readonly readyPromise: Promise<[void, void, void, void]>;
+  readonly readyPromise: Promise<[void, void, void, void, void]>;
 
   public studentSubmissions: Map<string, Database["public"]["Views"]["active_submissions_for_class"]["Row"][]> =
     new Map();
@@ -1460,6 +1476,13 @@ export class GradebookController {
 
     this.table = new GradebookCellController(class_id, classRealTimeController, client, initialGradebookRecords);
 
+    this.gradebook_column_groups = new TableController({
+      client,
+      table: "gradebook_column_groups",
+      query: client.from("gradebook_column_groups").select("*").eq("class_id", class_id),
+      classRealTimeController
+    });
+
     this.assignments_table = new TableController({
       client,
       table: "assignments",
@@ -1471,7 +1494,8 @@ export class GradebookController {
       this.gradebook_row.readyPromise,
       this.gradebook_columns.readyPromise,
       this.table.readyPromise,
-      this.assignments_table.readyPromise
+      this.assignments_table.readyPromise,
+      this.gradebook_column_groups.readyPromise
     ]);
 
     // Set up refetch status tracking
@@ -1534,6 +1558,7 @@ export class GradebookController {
     this.gradebook_row.close();
     this.gradebook_columns.close();
     this.table.close();
+    this.gradebook_column_groups.close();
     this.assignments_table.close();
     this._unsubscribes.forEach((unsubscribe) => unsubscribe());
     this._unsubscribes = [];

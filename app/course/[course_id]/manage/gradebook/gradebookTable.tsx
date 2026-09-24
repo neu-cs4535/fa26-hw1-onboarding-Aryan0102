@@ -23,6 +23,7 @@ import {
   useGradebookColumns,
   useGradebookController,
   useGradebookRefetchStatus,
+  useGradebookColumnGroups,
   useIsGradebookDataReady,
   useStudentDetailView
 } from "@/hooks/useGradebook";
@@ -224,6 +225,7 @@ type GradebookGroupedColumnRef = {
   sort_order: GradebookColumn["sort_order"];
   name: GradebookColumn["name"];
   max_score: GradebookColumn["max_score"];
+  group_id: GradebookColumn["group_id"];
 };
 
 /** Build left-to-right "units": each is a block of DB column ids. Collapsed groups = one unit (whole group). */
@@ -232,7 +234,7 @@ function buildVisibleReorderUnits(args: {
   groupedColumns: Record<string, { groupName: string; columns: GradebookGroupedColumnRef[] }>;
   collapsedGroups: Set<string>;
   findBestColumnToShow: (columns: GradebookGroupedColumnRef[]) => GradebookGroupedColumnRef;
-  gradebookColumns: { id: number; slug: string | null }[];
+  gradebookColumns: { id: number; slug: string | null; group_id: number | null }[];
 }): number[][] {
   const { scrollableLeafColumns, groupedColumns, collapsedGroups, findBestColumnToShow, gradebookColumns } = args;
   const units: number[][] = [];
@@ -240,26 +242,17 @@ function buildVisibleReorderUnits(args: {
     if (!String(leaf.id).startsWith("grade_")) continue;
     const colId = Number(String(leaf.id).slice(6));
     const col = gradebookColumns.find((c) => c.id === colId);
-    if (!col?.slug) {
+    if (!col || col.group_id === null) {
       units.push([colId]);
       continue;
     }
-    const slugParts = col.slug.split("-");
-    let baseGroupName: string;
-    if (slugParts[0] === "assignment" && slugParts.length >= 3) {
-      baseGroupName = `${slugParts[0]}-${slugParts[1]}`;
-    } else {
-      baseGroupName = slugParts[0] || "other";
-    }
-    const groupEntry = Object.entries(groupedColumns).find(
-      ([key, group]) => key.startsWith(baseGroupName) && group.columns.some((c) => c.id === colId)
-    );
-    if (!groupEntry || groupEntry[1].columns.length <= 1) {
+    const groupKey = `group-${col.group_id}`;
+    const group = groupedColumns[groupKey];
+    if (!group || group.columns.length <= 1) {
       units.push([colId]);
       continue;
     }
-    const group = groupEntry[1];
-    const collapsed = collapsedGroups.has(group.groupName);
+    const collapsed = collapsedGroups.has(groupKey);
     if (collapsed) {
       const best = findBestColumnToShow(group.columns);
       if (colId !== best.id) continue;
@@ -2446,6 +2439,7 @@ export default function GradebookTable() {
   const courseController = useCourseController();
   const gradebookController = useGradebookController();
   const gradebookColumns = useGradebookColumns();
+  const columnGroups = useGradebookColumnGroups();
   const [gradebookDataEpoch, setGradebookDataEpoch] = useState(0);
   useEffect(() => {
     return gradebookController.table.subscribeToData(() => {
@@ -2491,6 +2485,7 @@ export default function GradebookTable() {
 
   // State for collapsible groups - use base group name as key for stability
   const [collapsedGroups, setCollapsedGroups] = useState<Set<string>>(new Set());
+  const refetchedGroupIds = useRef<Set<number>>(new Set());
   const [isAutoLayouting, setIsAutoLayouting] = useState(false);
   const [exportWithRenderExpressions, setExportWithRenderExpressions] = useState(false);
   const [activeDragColumnId, setActiveDragColumnId] = useState<string | null>(null);
@@ -2548,89 +2543,88 @@ export default function GradebookTable() {
     slug: col.slug,
     sort_order: col.sort_order,
     name: col.name,
-    max_score: col.max_score
+    max_score: col.max_score,
+    group_id: col.group_id
   }));
   columnsForGrouping.sort((a, b) => (a.sort_order ?? 0) - (b.sort_order ?? 0));
   const cachedColumnsKey = JSON.stringify(columnsForGrouping);
-  // Group gradebook columns by slug prefix, with special handling for assignment sub-groups
+  // Group gradebook columns by their group_id
   const groupedColumns = useMemo(() => {
     const groups: Record<string, { groupName: string; columns: typeof columnsForGrouping }> = {};
     const columns = JSON.parse(cachedColumnsKey) as typeof columnsForGrouping;
 
-    columns.sort((a, b) => (a.sort_order ?? 0) - (b.sort_order ?? 0));
+    // Sort column groups by sort_order, then id
+    const sortedGroups = [...columnGroups].sort((a, b) => {
+      if (a.sort_order !== b.sort_order) return (a.sort_order ?? 0) - (b.sort_order ?? 0);
+      return a.id - b.id;
+    });
 
-    let currentGroupKey = "";
-    let currentGroupIndex = 0;
-    let lastSortOrder = -1;
+    sortedGroups.forEach((group) => {
+      const groupColumns = columns.filter((c) => c.group_id === group.id);
+      if (groupColumns.length === 0) return;
 
+      // Ensure columns within the group are sorted
+      groupColumns.sort((a, b) => (a.sort_order ?? 0) - (b.sort_order ?? 0));
+
+      groups[`group-${group.id}`] = {
+        groupName: group.title,
+        columns: groupColumns
+      };
+    });
+
+    const unknownGroupKeys = new Set<string>();
+
+    // Handle columns whose group_id isn't in columnGroups (e.g. newly inserted)
     columns.forEach((col) => {
-      const slugParts = col.slug.split("-");
-      let baseGroupName: string;
-
-      // Special handling for assignment columns
-      if (slugParts[0] === "assignment" && slugParts.length >= 3) {
-        // For assignment-assignment-*, assignment-lab-*, etc., use "assignment-{type}" as the base group
-        baseGroupName = `${slugParts[0]}-${slugParts[1]}`;
-      } else {
-        // For all other columns, use the first part as the base group
-        baseGroupName = slugParts[0] || "other";
-      }
-
-      // Check if this column is contiguous with the previous one
-      const currentSortOrder = col.sort_order ?? 0;
-      const isContiguous = lastSortOrder === -1 || currentSortOrder === lastSortOrder + 1;
-
-      // If not contiguous or different prefix, start a new group
-      if (!isContiguous || baseGroupName !== currentGroupKey) {
-        currentGroupKey = baseGroupName;
-        currentGroupIndex++;
-      }
-
-      const groupKey = `${baseGroupName}-${currentGroupIndex}`;
-
-      if (!groups[groupKey]) {
-        // Format group name for display
-        let displayName: string;
-        if (baseGroupName === "other") {
-          displayName = "Other";
-        } else if (baseGroupName.startsWith("assignment-")) {
-          // For assignment sub-groups, capitalize and format nicely
-          const subType = baseGroupName.split("-")[1];
-          displayName = `${subType.charAt(0).toUpperCase() + subType.slice(1)}`;
-        } else {
-          displayName = baseGroupName.charAt(0).toUpperCase() + baseGroupName.slice(1);
-        }
-
-        groups[groupKey] = {
-          groupName: displayName,
+      if (col.group_id !== null && !groups[`group-${col.group_id}`]) {
+        groups[`group-${col.group_id}`] = {
+          groupName: "Other",
           columns: []
         };
+        unknownGroupKeys.add(`group-${col.group_id}`);
       }
-
-      groups[groupKey].columns.push(col);
-      lastSortOrder = currentSortOrder;
+      if (col.group_id !== null && unknownGroupKeys.has(`group-${col.group_id}`)) {
+        groups[`group-${col.group_id}`].columns.push(col);
+      }
     });
 
     return groups;
-  }, [cachedColumnsKey]);
+  }, [cachedColumnsKey, columnGroups]);
+
+  // Refetch unknown groups outside of the memo
+  useEffect(() => {
+    let needsRefetch = false;
+    columnsForGrouping.forEach((col) => {
+      if (col.group_id !== null) {
+        if (!columnGroups.some((g) => g.id === col.group_id) && !refetchedGroupIds.current.has(col.group_id)) {
+          refetchedGroupIds.current.add(col.group_id);
+          needsRefetch = true;
+        }
+      }
+    });
+
+    if (needsRefetch) {
+      gradebookController.gradebook_column_groups.refetchAll();
+    }
+  }, [columnsForGrouping, columnGroups, gradebookController]);
 
   // Initialize all groups as collapsed by default, but preserve existing collapsed state
   useEffect(() => {
     const allGroupKeys = Object.keys(groupedColumns).filter((key) => groupedColumns[key].columns.length > 1);
-    const baseGroupNames = [...new Set(allGroupKeys.map((key) => groupedColumns[key].groupName))];
+
     setCollapsedGroups((prev) => {
       const newSet = new Set<string>();
 
       // Preserve existing collapsed state for groups that still exist
-      baseGroupNames.forEach((baseGroupName) => {
-        if (prev.has(baseGroupName)) {
-          newSet.add(baseGroupName);
+      allGroupKeys.forEach((groupKey) => {
+        if (prev.has(groupKey)) {
+          newSet.add(groupKey);
         }
       });
 
       // If no groups were previously collapsed, collapse all by default
-      if (newSet.size === 0 && baseGroupNames.length > 0) {
-        baseGroupNames.forEach((baseGroupName) => newSet.add(baseGroupName));
+      if (newSet.size === 0 && allGroupKeys.length > 0) {
+        allGroupKeys.forEach((groupKey) => newSet.add(groupKey));
       }
 
       return newSet;
@@ -2672,13 +2666,13 @@ export default function GradebookTable() {
 
   // Toggle group collapse/expand using base group name
   const toggleGroup = useCallback(
-    (baseGroupName: string) => {
+    (groupKey: string) => {
       setCollapsedGroups((prev) => {
         const newSet = new Set(prev);
-        if (newSet.has(baseGroupName)) {
-          newSet.delete(baseGroupName);
+        if (newSet.has(groupKey)) {
+          newSet.delete(groupKey);
         } else {
-          newSet.add(baseGroupName);
+          newSet.add(groupKey);
         }
         return newSet;
       });
@@ -2757,8 +2751,7 @@ export default function GradebookTable() {
   // Collapse all groups
   const collapseAll = useCallback(() => {
     const allGroupKeys = Object.keys(groupedColumns).filter((key) => groupedColumns[key].columns.length > 1);
-    const baseGroupNames = [...new Set(allGroupKeys.map((key) => groupedColumns[key].groupName))];
-    setCollapsedGroups(new Set(baseGroupNames));
+    setCollapsedGroups(new Set(allGroupKeys));
     forceRecalculation();
   }, [groupedColumns, forceRecalculation]);
 
@@ -2914,8 +2907,8 @@ export default function GradebookTable() {
           enableSorting: true
         });
       } else {
-        // Multiple columns - handle collapsed state using base group name
-        const isCollapsed = collapsedGroups.has(group.groupName);
+        // Multiple columns - handle collapsed state using groupKey
+        const isCollapsed = collapsedGroups.has(groupKey);
         const columnsToShow = isCollapsed ? [findBestColumnToShow(group.columns)] : group.columns;
 
         columnsToShow.forEach((col) => {
@@ -3251,6 +3244,7 @@ export default function GradebookTable() {
       width: number;
       key: string;
       groupName: string;
+      groupKey: string;
       isCollapsed: boolean;
       groupColumnsLen: number;
     };
@@ -3261,25 +3255,21 @@ export default function GradebookTable() {
       const leaf = scrollableLeafColumns[i];
       const columnId = Number(leaf.id.slice(6));
       const column = gradebookColumns.find((c) => c.id === columnId);
-      if (!column) {
+      if (!column || column.group_id === null) {
         pos += getColWidth(leaf.id);
         i++;
         continue;
       }
-      const prefix = column.slug.split("-")[0];
-      const baseGroupName = prefix || "other";
-      const groupEntry = Object.entries(groupedColumns).find(
-        ([key, group]) => key.startsWith(baseGroupName) && group.columns.some((col) => col.id === columnId)
-      );
-      if (!groupEntry || groupEntry[1].columns.length <= 1) {
+      const groupKey = `group-${column.group_id}`;
+      const group = groupedColumns[groupKey];
+      if (!group || group.columns.length <= 1) {
         pos += getColWidth(leaf.id);
         i++;
         continue;
       }
-      const group = groupEntry[1];
       const groupColumns = group.columns;
       const isFirstInGroup = groupColumns[0].id === columnId;
-      const isCollapsed = collapsedGroups.has(group.groupName);
+      const isCollapsed = collapsedGroups.has(groupKey);
       const bestCol = findBestColumnToShow(groupColumns);
       const isVisibleWhenCollapsed = isCollapsed && columnId === bestCol.id;
 
@@ -3292,8 +3282,9 @@ export default function GradebookTable() {
         segments.push({
           left: pos,
           width,
-          key: `grp-${group.groupName}-${columnId}`,
+          key: `grp-${groupKey}-${columnId}`,
           groupName: group.groupName,
+          groupKey,
           isCollapsed,
           groupColumnsLen: groupColumns.length
         });
@@ -3314,19 +3305,15 @@ export default function GradebookTable() {
         const columnId = Number(header.column.id.slice(6));
         const column = gradebookColumns.find((col) => col.id === columnId);
 
-        if (column) {
-          const prefix = column.slug.split("-")[0];
-          const baseGroupName = prefix || "other";
+        if (column && column.group_id !== null) {
+          const groupKey = `group-${column.group_id}`;
+          const group = groupedColumns[groupKey];
 
-          const groupEntry = Object.entries(groupedColumns).find(
-            ([key, group]) => key.startsWith(baseGroupName) && group.columns.some((col) => col.id === columnId)
-          );
-
-          if (groupEntry && groupEntry[1].columns.length > 1) {
-            const isCollapsed = collapsedGroups.has(groupEntry[1].groupName);
+          if (group && group.columns.length > 1) {
+            const isCollapsed = collapsedGroups.has(groupKey);
 
             if (isCollapsed) {
-              const bestColumn = findBestColumnToShow(groupEntry[1].columns);
+              const bestColumn = findBestColumnToShow(group.columns);
               return columnId === bestColumn.id;
             }
           }
@@ -3359,7 +3346,7 @@ export default function GradebookTable() {
                 left={0}
                 top={0}
                 bottom={0}
-                onClick={() => toggleGroup((cell.column.columnDef.meta as { groupName?: string })?.groupName || "")}
+                onClick={() => toggleGroup((cell.column.columnDef.meta as { groupKey?: string })?.groupKey || "")}
                 aria-label="Expand group"
                 colorPalette="blue"
                 opacity={0.8}
@@ -3716,7 +3703,7 @@ export default function GradebookTable() {
                           minH="36px"
                           bg={seg.isCollapsed ? "bg.warning" : "bg.emphasized"}
                           cursor="pointer"
-                          onClick={() => toggleGroup(seg.groupName)}
+                          onClick={() => toggleGroup(seg.groupKey)}
                           _hover={{ bg: "bg.info" }}
                           borderBottom="1px solid"
                           borderColor="border.emphasized"
@@ -3726,7 +3713,7 @@ export default function GradebookTable() {
                         >
                           <HStack gap={2} justifyContent="center" alignItems="center" py={1}>
                             <Icon
-                              as={collapsedGroups.has(seg.groupName) ? LuChevronRight : LuChevronDown}
+                              as={collapsedGroups.has(seg.groupKey) ? LuChevronRight : LuChevronDown}
                               boxSize={3}
                               color="fg.muted"
                             />
