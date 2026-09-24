@@ -236,7 +236,7 @@ function buildVisibleReorderUnits(args: {
   groupedColumns: Record<string, { groupName: string; columns: GradebookGroupedColumnRef[] }>;
   collapsedGroups: Set<string>;
   findBestColumnToShow: (columns: GradebookGroupedColumnRef[]) => GradebookGroupedColumnRef;
-  gradebookColumns: { id: number; slug: string | null; group_id: number | null }[];
+  gradebookColumns: { id: number; group_id: number | null }[];
 }): number[][] {
   const { scrollableLeafColumns, groupedColumns, collapsedGroups, findBestColumnToShow, gradebookColumns } = args;
   const units: number[][] = [];
@@ -2938,22 +2938,25 @@ export default function GradebookTable() {
     return groups;
   }, [cachedColumnsKey, columnGroups]);
 
-  // Refetch unknown groups outside of the memo
+  // Fetch groups that columns point at but that aren't loaded yet (e.g. created by the insert trigger)
   useEffect(() => {
-    let needsRefetch = false;
-    columnsForGrouping.forEach((col) => {
-      if (col.group_id !== null) {
-        if (!columnGroups.some((g) => g.id === col.group_id) && !refetchedGroupIds.current.has(col.group_id)) {
-          refetchedGroupIds.current.add(col.group_id);
-          needsRefetch = true;
-        }
-      }
-    });
+    const columns = JSON.parse(cachedColumnsKey) as typeof columnsForGrouping;
+    const loadedGroupIds = new Set(columnGroups.map((g) => g.id));
+    const missingGroupIds: number[] = [];
 
-    if (needsRefetch) {
-      gradebookController.gradebook_column_groups.refetchAll();
+    for (const col of columns) {
+      const groupId = col.group_id;
+      if (groupId === null) continue;
+      if (loadedGroupIds.has(groupId)) continue;
+      if (refetchedGroupIds.current.has(groupId)) continue;
+      refetchedGroupIds.current.add(groupId);
+      missingGroupIds.push(groupId);
     }
-  }, [columnsForGrouping, columnGroups, gradebookController]);
+
+    if (missingGroupIds.length > 0) {
+      gradebookController.gradebook_column_groups.refetchByIds(missingGroupIds).catch(() => {});
+    }
+  }, [cachedColumnsKey, columnGroups, gradebookController]);
 
   // Collapse each group the first time it appears, but preserve existing collapsed state
   const seenGroupKeys = useRef<Set<string>>(new Set());
