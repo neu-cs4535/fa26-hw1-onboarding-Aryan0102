@@ -1185,19 +1185,20 @@ function ManageGroupRow({
         p_group_ids: ids
       });
       if (error) throw error;
-      await gradebookController.gradebook_column_groups.refetchAll();
+      await gradebookController.gradebook_column_groups.refetchByIds(ids);
     }, "Failed to reorder groups");
 
   const remove = () =>
     run(async () => {
       if (columnCount > 0) {
         if (moveToGroupId === undefined) throw new Error("Choose a group to move the columns to");
-        const { error } = await supabase
+        const { data: moved, error } = await supabase
           .from("gradebook_columns")
           .update({ group_id: moveToGroupId })
-          .eq("group_id", group.id);
+          .eq("group_id", group.id)
+          .select("id");
         if (error) throw error;
-        await gradebookController.gradebook_columns.refetchAll();
+        await gradebookController.gradebook_columns.refetchByIds(moved.map((c) => c.id));
       }
       await gradebookController.gradebook_column_groups.hardDelete(group.id);
       toaster.create({ title: "Group deleted", type: "success" });
