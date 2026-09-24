@@ -2958,14 +2958,10 @@ export default function GradebookTable() {
     }
   }, [cachedColumnsKey, columnGroups, gradebookController]);
 
-  // Collapse each group the first time it appears, but preserve existing collapsed state
-  const seenGroupKeys = useRef<Set<string>>(new Set());
+  // Groups start expanded; keep the instructor's collapsed choices for groups that still exist
   useEffect(() => {
     const allGroupKeys = Object.keys(groupedColumns).filter((key) => groupedColumns[key].columns.length > 1);
-    const newGroupKeys = new Set(allGroupKeys.filter((key) => !seenGroupKeys.current.has(key)));
-    allGroupKeys.forEach((groupKey) => seenGroupKeys.current.add(groupKey));
-
-    setCollapsedGroups((prev) => new Set(allGroupKeys.filter((key) => prev.has(key) || newGroupKeys.has(key))));
+    setCollapsedGroups((prev) => new Set(allGroupKeys.filter((key) => prev.has(key))));
   }, [groupedColumns]);
 
   // Force recalculation helper
