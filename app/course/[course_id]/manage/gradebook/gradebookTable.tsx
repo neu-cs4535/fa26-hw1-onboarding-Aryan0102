@@ -37,6 +37,7 @@ import {
   LabSection,
   UserProfile
 } from "@/utils/supabase/DatabaseTypes";
+import { Database } from "@/utils/supabase/SupabaseTypes";
 import {
   Box,
   Button,
@@ -48,6 +49,7 @@ import {
   Input,
   Link,
   List,
+  NativeSelect,
   Portal,
   Spinner,
   Table,
@@ -1120,6 +1122,337 @@ function DeleteColumnDialog({ columnId, onClose }: { columnId: number; onClose: 
   );
 }
 
+type GradebookColumnGroup = Database["public"]["Tables"]["gradebook_column_groups"]["Row"];
+
+function sortGroups(groups: GradebookColumnGroup[]) {
+  return [...groups].sort((a, b) => a.sort_order - b.sort_order || a.id - b.id);
+}
+
+function toastError(title: string, error: unknown) {
+  toaster.create({
+    title,
+    description: error instanceof Error ? error.message : "An unexpected error occurred",
+    type: "error"
+  });
+}
+
+function ManageGroupRow({
+  group,
+  groups,
+  columnCount,
+  index
+}: {
+  group: GradebookColumnGroup;
+  groups: GradebookColumnGroup[];
+  columnCount: number;
+  index: number;
+}) {
+  const supabase = useMemo(() => createClient(), []);
+  const gradebookController = useGradebookController();
+  const [title, setTitle] = useState(group.title);
+  const [isBusy, setIsBusy] = useState(false);
+  const [isConfirmingDelete, setIsConfirmingDelete] = useState(false);
+  const otherGroups = groups.filter((g) => g.id !== group.id);
+  const [moveToGroupId, setMoveToGroupId] = useState<number | undefined>(otherGroups[0]?.id);
+
+  useEffect(() => {
+    setTitle(group.title);
+  }, [group.title]);
+
+  const run = async (action: () => Promise<void>, errorTitle: string) => {
+    setIsBusy(true);
+    try {
+      await action();
+    } catch (error) {
+      toastError(errorTitle, error);
+    } finally {
+      setIsBusy(false);
+    }
+  };
+
+  const rename = () =>
+    run(async () => {
+      await gradebookController.gradebook_column_groups.update(group.id, { title: title.trim() });
+      toaster.create({ title: "Group renamed", type: "success" });
+    }, "Failed to rename group");
+
+  const move = (offset: -1 | 1) =>
+    run(async () => {
+      const ids = groups.map((g) => g.id);
+      [ids[index], ids[index + offset]] = [ids[index + offset], ids[index]];
+      const { error } = await supabase.rpc("reorder_gradebook_column_groups", {
+        p_class_id: gradebookController.class_id,
+        p_group_ids: ids
+      });
+      if (error) throw error;
+      await gradebookController.gradebook_column_groups.refetchAll();
+    }, "Failed to reorder groups");
+
+  const remove = () =>
+    run(async () => {
+      if (columnCount > 0) {
+        if (moveToGroupId === undefined) throw new Error("Choose a group to move the columns to");
+        const { error } = await supabase
+          .from("gradebook_columns")
+          .update({ group_id: moveToGroupId })
+          .eq("group_id", group.id);
+        if (error) throw error;
+        await gradebookController.gradebook_columns.refetchAll();
+      }
+      await gradebookController.gradebook_column_groups.hardDelete(group.id);
+      toaster.create({ title: "Group deleted", type: "success" });
+    }, "Failed to delete group");
+
+  return (
+    <VStack gap={1} align="stretch" borderBottom="1px solid" borderColor="border.muted" py={2}>
+      <HStack gap={2}>
+        <Input size="sm" value={title} onChange={(e) => setTitle(e.target.value)} aria-label="Group title" />
+        {title.trim() !== group.title && (
+          <Button size="sm" onClick={rename} disabled={isBusy || title.trim() === ""}>
+            Save
+          </Button>
+        )}
+        <Text fontSize="sm" color="fg.muted" flexShrink={0}>
+          {columnCount} {pluralize("column", columnCount)}
+        </Text>
+        <IconButton
+          size="sm"
+          variant="ghost"
+          aria-label="Move group up"
+          onClick={() => move(-1)}
+          disabled={isBusy || index === 0}
+        >
+          <Icon as={LuArrowUp} />
+        </IconButton>
+        <IconButton
+          size="sm"
+          variant="ghost"
+          aria-label="Move group down"
+          onClick={() => move(1)}
+          disabled={isBusy || index === groups.length - 1}
+        >
+          <Icon as={LuArrowDown} />
+        </IconButton>
+        <IconButton
+          size="sm"
+          variant="ghost"
+          colorPalette="red"
+          aria-label="Delete group"
+          onClick={() => (columnCount === 0 ? remove() : setIsConfirmingDelete(true))}
+          disabled={isBusy || otherGroups.length === 0}
+        >
+          {isBusy ? <Spinner size="xs" /> : <Icon as={LuTrash} />}
+        </IconButton>
+      </HStack>
+      {isConfirmingDelete && (
+        <HStack gap={2}>
+          <Text fontSize="sm" flexShrink={0}>
+            Move {columnCount} {pluralize("column", columnCount)} to
+          </Text>
+          <NativeSelect.Root size="sm">
+            <NativeSelect.Field value={moveToGroupId} onChange={(e) => setMoveToGroupId(Number(e.target.value))}>
+              {otherGroups.map((g) => (
+                <option key={g.id} value={g.id}>
+                  {g.title}
+                </option>
+              ))}
+            </NativeSelect.Field>
+          </NativeSelect.Root>
+          <Button size="sm" colorPalette="red" onClick={remove} loading={isBusy}>
+            Delete
+          </Button>
+          <Button size="sm" variant="ghost" onClick={() => setIsConfirmingDelete(false)}>
+            Cancel
+          </Button>
+        </HStack>
+      )}
+    </VStack>
+  );
+}
+
+function ManageGroupsDialog() {
+  const [isOpen, setIsOpen] = useState(false);
+  const [newTitle, setNewTitle] = useState("");
+  const [isCreating, setIsCreating] = useState(false);
+  const gradebookController = useGradebookController();
+  const groups = sortGroups(useGradebookColumnGroups());
+  const columns = useGradebookColumns();
+
+  const create = async () => {
+    setIsCreating(true);
+    try {
+      await gradebookController.gradebook_column_groups.create({
+        class_id: gradebookController.class_id,
+        title: newTitle.trim(),
+        sort_order: groups.reduce((max, g) => Math.max(max, g.sort_order + 1), 0)
+      });
+      setNewTitle("");
+      toaster.create({ title: "Group created", type: "success" });
+    } catch (error) {
+      toastError("Failed to create group", error);
+    } finally {
+      setIsCreating(false);
+    }
+  };
+
+  return (
+    <Dialog.Root
+      open={isOpen}
+      onOpenChange={(e) => setIsOpen(e.open)}
+      size="lg"
+      placement="center"
+      lazyMount
+      unmountOnExit
+    >
+      <Dialog.Trigger asChild>
+        <Button variant="surface" size="sm" onClick={() => setIsOpen(true)}>
+          <Icon as={LuLayoutGrid} mr={2} /> Groups
+        </Button>
+      </Dialog.Trigger>
+      <Portal>
+        <Dialog.Backdrop />
+        <Dialog.Positioner>
+          <Dialog.Content>
+            <Dialog.Header>
+              <Dialog.Title>Column Groups</Dialog.Title>
+            </Dialog.Header>
+            <Dialog.Body>
+              <VStack gap={0} align="stretch">
+                {groups.map((group, index) => (
+                  <ManageGroupRow
+                    key={group.id}
+                    group={group}
+                    groups={groups}
+                    index={index}
+                    columnCount={columns.filter((c) => c.group_id === group.id).length}
+                  />
+                ))}
+              </VStack>
+              <HStack gap={2} mt={4}>
+                <Input
+                  size="sm"
+                  placeholder="New group title"
+                  value={newTitle}
+                  onChange={(e) => setNewTitle(e.target.value)}
+                />
+                <Button
+                  size="sm"
+                  colorPalette="green"
+                  onClick={create}
+                  loading={isCreating}
+                  disabled={newTitle.trim() === ""}
+                >
+                  <Icon as={FiPlus} mr={1} /> Add Group
+                </Button>
+              </HStack>
+              <Text fontSize="xs" color="fg.muted" mt={2}>
+                An empty group shows up in the gradebook once you move a column into it with the column&apos;s
+                &quot;Move to Group&quot; menu item.
+              </Text>
+            </Dialog.Body>
+            <Dialog.Footer>
+              <Button variant="ghost" onClick={() => setIsOpen(false)}>
+                Close
+              </Button>
+            </Dialog.Footer>
+          </Dialog.Content>
+        </Dialog.Positioner>
+      </Portal>
+    </Dialog.Root>
+  );
+}
+
+function MoveColumnToGroupDialog({ columnId, onClose }: { columnId: number; onClose: () => void }) {
+  const gradebookController = useGradebookController();
+  const groups = sortGroups(useGradebookColumnGroups());
+  const column = useGradebookColumn(columnId);
+  const [groupId, setGroupId] = useState<number | "new">(column?.group_id ?? groups[0]?.id ?? "new");
+  const [newTitle, setNewTitle] = useState("");
+  const [isSaving, setIsSaving] = useState(false);
+
+  const save = async () => {
+    setIsSaving(true);
+    try {
+      let targetGroupId = groupId;
+      if (targetGroupId === "new") {
+        const created = await gradebookController.gradebook_column_groups.create({
+          class_id: gradebookController.class_id,
+          title: newTitle.trim(),
+          sort_order: groups.reduce((max, g) => Math.max(max, g.sort_order + 1), 0)
+        });
+        targetGroupId = created.id;
+      }
+      await gradebookController.gradebook_columns.update(columnId, { group_id: targetGroupId });
+      toaster.create({ title: "Column moved", type: "success" });
+      onClose();
+    } catch (error) {
+      toastError("Failed to move column", error);
+    } finally {
+      setIsSaving(false);
+    }
+  };
+
+  return (
+    <Dialog.Root
+      open={true}
+      onOpenChange={(e) => !e.open && onClose()}
+      size="sm"
+      placement="center"
+      lazyMount
+      unmountOnExit
+    >
+      <Portal>
+        <Dialog.Backdrop />
+        <Dialog.Positioner>
+          <Dialog.Content>
+            <Dialog.Header>
+              <Dialog.Title>Move &quot;{column?.name}&quot; to Group</Dialog.Title>
+            </Dialog.Header>
+            <Dialog.Body>
+              <VStack gap={2} align="stretch">
+                <NativeSelect.Root size="sm">
+                  <NativeSelect.Field
+                    value={groupId}
+                    onChange={(e) => setGroupId(e.target.value === "new" ? "new" : Number(e.target.value))}
+                  >
+                    {groups.map((g) => (
+                      <option key={g.id} value={g.id}>
+                        {g.title}
+                      </option>
+                    ))}
+                    <option value="new">New group…</option>
+                  </NativeSelect.Field>
+                </NativeSelect.Root>
+                {groupId === "new" && (
+                  <Input
+                    size="sm"
+                    placeholder="New group title"
+                    value={newTitle}
+                    onChange={(e) => setNewTitle(e.target.value)}
+                  />
+                )}
+              </VStack>
+            </Dialog.Body>
+            <Dialog.Footer>
+              <Button variant="ghost" onClick={onClose}>
+                Cancel
+              </Button>
+              <Button
+                colorPalette="green"
+                onClick={save}
+                loading={isSaving}
+                disabled={groupId === column?.group_id || (groupId === "new" && newTitle.trim() === "")}
+              >
+                Move
+              </Button>
+            </Dialog.Footer>
+          </Dialog.Content>
+        </Dialog.Positioner>
+      </Portal>
+    </Dialog.Root>
+  );
+}
+
 function ExternalDataAdvice({ externalData }: { externalData: GradebookColumnExternalData }) {
   return (
     <VStack gap={0} align="flex-start">
@@ -1706,6 +2039,7 @@ function GradebookColumnHeader({
   const [isEditing, setIsEditing] = useState(false);
   const [isDeleting, setIsDeleting] = useState(false);
   const [isConvertingMissing, setIsConvertingMissing] = useState(false);
+  const [isMovingToGroup, setIsMovingToGroup] = useState(false);
   const [showFilter, setShowFilter] = useState(false);
   const [isMovingLeft, setIsMovingLeft] = useState(false);
   const [isMovingRight, setIsMovingRight] = useState(false);
@@ -1919,6 +2253,14 @@ function GradebookColumnHeader({
           }}
         />
       )}
+      {isMovingToGroup && (
+        <MoveColumnToGroupDialog
+          columnId={column_id}
+          onClose={() => {
+            setIsMovingToGroup(false);
+          }}
+        />
+      )}
 
       {/* Main header content */}
       <Box
@@ -1976,6 +2318,10 @@ function GradebookColumnHeader({
               <MenuItem value="edit" onClick={() => setIsEditing(true)}>
                 <Icon as={LuPencil} boxSize={3} mr={2} />
                 Edit Column
+              </MenuItem>
+              <MenuItem value="moveToGroup" onClick={() => setIsMovingToGroup(true)}>
+                <Icon as={LuLayoutGrid} boxSize={3} mr={2} />
+                Move to Group
               </MenuItem>
               <MenuItem
                 value="moveLeft"
@@ -3964,6 +4310,7 @@ export default function GradebookTable() {
               </PopoverContent>
             </PopoverRoot>
             <ImportGradebookColumn />
+            <ManageGroupsDialog />
             <AddColumnDialog />
           </HStack>
         )}
