@@ -2955,27 +2955,14 @@ export default function GradebookTable() {
     }
   }, [columnsForGrouping, columnGroups, gradebookController]);
 
-  // Initialize all groups as collapsed by default, but preserve existing collapsed state
+  // Collapse each group the first time it appears, but preserve existing collapsed state
+  const seenGroupKeys = useRef<Set<string>>(new Set());
   useEffect(() => {
     const allGroupKeys = Object.keys(groupedColumns).filter((key) => groupedColumns[key].columns.length > 1);
+    const newGroupKeys = new Set(allGroupKeys.filter((key) => !seenGroupKeys.current.has(key)));
+    allGroupKeys.forEach((groupKey) => seenGroupKeys.current.add(groupKey));
 
-    setCollapsedGroups((prev) => {
-      const newSet = new Set<string>();
-
-      // Preserve existing collapsed state for groups that still exist
-      allGroupKeys.forEach((groupKey) => {
-        if (prev.has(groupKey)) {
-          newSet.add(groupKey);
-        }
-      });
-
-      // If no groups were previously collapsed, collapse all by default
-      if (newSet.size === 0 && allGroupKeys.length > 0) {
-        allGroupKeys.forEach((groupKey) => newSet.add(groupKey));
-      }
-
-      return newSet;
-    });
+    setCollapsedGroups((prev) => new Set(allGroupKeys.filter((key) => prev.has(key) || newGroupKeys.has(key))));
   }, [groupedColumns]);
 
   // Force recalculation helper
